@@ -1,0 +1,738 @@
+---
+title: "First and second stage sampling 0318"
+author: "Ruisi Ma"
+date: "2026-03-18"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# First-stage PSU sampling for Detroit project
+# PSU = Census tract (after combining small tracts if needed)
+# Method = systematic PPS using composite MOS
+# File: Detroit MI.xlsx
+
+## 0. Packages
+library(readxl)
+library(dplyr)
+library(stringr)
+library(sampling)
+library(purrr)
+
+## 1. Read data
+file_path <- "C:/Users/lenovo/Desktop/745 code/Detroit MI_Updated.xlsx"
+
+tract_raw <- read_excel(file_path, sheet = "Tract")
+bg_raw    <- read_excel(file_path, sheet = "BlockGroup")
+
+## 2. Clean IDs
+tract_raw <- tract_raw %>%
+  mutate(Tract = as.character(Tract))
+
+bg_raw <- bg_raw %>%
+  mutate(
+    BlockGroup = as.character(BlockGroup),
+    Tract = substr(BlockGroup, 1, 11)
+  )
+
+## 3. Build tract frame
+tract <- tract_raw %>%
+  distinct(Tract, .keep_all = TRUE)
+
+bg_counts <- bg_raw %>%
+  count(Tract, name = "n_BG")
+
+tract <- tract %>%
+  left_join(bg_counts, by = "Tract") %>%
+  mutate(n_BG = ifelse(is.na(n_BG), 0L, n_BG))
+
+## 4. Construct age-domain counts
+tract <- tract %>%
+  mutate(
+    Q1_18_34 =
+      Male18to19Yrs + Male20Yrs + Male21Yrs + Male22to24Yrs +
+      Male25to29Yrs + Male30to34Yrs +
+      Female18to19Yrs + Female20Yrs + Female21Yrs + Female22to24Yrs +
+      Female25to29Yrs + Female30to34Yrs,
+
+    Q2_35_49 =
+      Male35to39Yrs + Male40to44Yrs + Male45to49Yrs +
+      Female35to39Yrs + Female40to44Yrs + Female45to49Yrs,
+
+    Q3_50_64 =
+      Male50to54Yrs + Male55to59Yrs + Male60to61Yrs + Male62to64Yrs +
+      Female50to54Yrs + Female55to59Yrs + Female60to61Yrs + Female62to64Yrs,
+
+    Q4_65plus =
+      Male65to66Yrs + Male67to69Yrs + Male70to74Yrs + Male75to79Yrs +
+      Male80to84Yrs + MaleGE85Yrs +
+      Female65to66Yrs + Female67to69Yrs + Female70to74Yrs + Female75to79Yrs +
+      Female80to84Yrs + FemaleGE85Yrs
+  ) %>%
+  mutate(
+    TotAdult18plus = Q1_18_34 + Q2_35_49 + Q3_50_64 + Q4_65plus
+  )
+
+## 5. Domain targets and rates
+n1 <- 250; n2 <- 250; n3 <- 250; n4 <- 250
+r1 <- 0.35; r2 <- 0.45; r3 <- 0.50; r4 <- 0.65
+
+m1 <- n1 / r1
+m2 <- n2 / r2
+m3 <- n3 / r3
+m4 <- n4 / r4
+
+Q1_total <- sum(tract$Q1_18_34, na.rm = TRUE)
+Q2_total <- sum(tract$Q2_35_49, na.rm = TRUE)
+Q3_total <- sum(tract$Q3_50_64, na.rm = TRUE)
+Q4_total <- sum(tract$Q4_65plus, na.rm = TRUE)
+
+f1 <- m1 / Q1_total
+f2 <- m2 / Q2_total
+f3 <- m3 / Q3_total
+f4 <- m4 / Q4_total
+
+domain_rates <- data.frame(
+  domain = c("18-34", "35-49", "50-64", "65+"),
+  n_resp = c(n1, n2, n3, n4),
+  resp_rate = c(r1, r2, r3, r4),
+  m_selected = c(m1, m2, m3, m4),
+  Q_total = c(Q1_total, Q2_total, Q3_total, Q4_total),
+  f_d = c(f1, f2, f3, f4)
+)
+
+print(domain_rates)
+
+## 6. Composite MOS at tract level
+## Si = sum_d f_d * Qi(d)
+tract <- tract %>%
+  mutate(
+    Si =
+      f1 * Q1_18_34 +
+      f2 * Q2_35_49 +
+      f3 * Q3_50_64 +
+      f4 * Q4_65plus
+  )
+
+## 7. Remove zero-MOS tracts from active sampling frame
+## Keep them for documentation/QC
+tract_zero_mos <- tract %>%
+  filter(Si <= 0)
+
+tract_pos <- tract %>%
+  filter(Si > 0) %>%
+  arrange(Tract)
+
+## 8. Initial qbarbar using uncombined positive-MOS tracts
+## Used only to identify small tracts that must be handled
+m_psu <- 40
+nbar  <- 1
+
+S_total_initial <- sum(tract_pos$Si, na.rm = TRUE)
+qbarbar_initial <- S_total_initial / (m_psu * nbar)
+
+tract_pos <- tract_pos %>%
+  mutate(
+    pi1_initial = m_psu * Si / S_total_initial,
+    w1_initial  = 1 / pi1_initial,
+    fail_bg     = n_BG < 2,
+    fail_qi     = qbarbar_initial > TotAdult18plus,
+    fail_pi     = pi1_initial > 1
+  )
+
+## 9. Identify tracts needing special handling
+## Main combine rule:
+## - n_BG < 2 OR
+## - qbarbar > adult population
+tract_pos <- tract_pos %>%
+  mutate(
+    must_combine = fail_bg | fail_qi
+  )
+
+combine_candidates <- tract_pos %>%
+  filter(must_combine)
+
+print(combine_candidates %>%
+        select(Tract, NAME, n_BG, TotAdult18plus, Si,
+               pi1_initial, w1_initial, fail_bg, fail_qi))
+
+## 10. Create tract-to-tract links for combining
+## - sort by Tract
+## - each flagged tract is linked to the nearest available tract
+## - avoid re-using a tract that is already assigned
+##
+## This is an operational adjacency proxy based on tract order.
+tract_ids <- tract_pos$Tract
+used_as_partner <- character(0)
+
+find_partner <- function(target_tract, all_tracts, flagged_tracts, already_used) {
+  idx <- match(target_tract, all_tracts)
+
+  # search outward from nearest neighbors in sorted order
+  offsets <- c(rbind(seq(1, length(all_tracts)), -seq(1, length(all_tracts))))
+  offsets <- offsets[!is.na(offsets)]
+
+  for (off in offsets) {
+    j <- idx + off
+    if (j >= 1 && j <= length(all_tracts)) {
+      cand <- all_tracts[j]
+
+      # cannot partner with itself
+      # cannot partner with a tract already used as partner
+      # cannot partner with another flagged tract that is itself waiting to be linked
+      if (cand != target_tract &&
+          !(cand %in% already_used) &&
+          !(cand %in% flagged_tracts)) {
+        return(cand)
+      }
+    }
+  }
+  return(NA_character_)
+}
+
+flagged_tracts <- tract_pos %>%
+  filter(must_combine) %>%
+  pull(Tract)
+
+combine_map <- data.frame(
+  tract_small = character(0),
+  tract_partner = character(0),
+  stringsAsFactors = FALSE
+)
+
+for (tr in flagged_tracts) {
+  if (!(tr %in% combine_map$tract_small) && !(tr %in% used_as_partner)) {
+    partner <- find_partner(
+      target_tract = tr,
+      all_tracts = tract_ids,
+      flagged_tracts = flagged_tracts,
+      already_used = used_as_partner
+    )
+
+    if (!is.na(partner)) {
+      combine_map <- bind_rows(
+        combine_map,
+        data.frame(
+          tract_small   = tr,
+          tract_partner = partner,
+          stringsAsFactors = FALSE
+        )
+      )
+      used_as_partner <- c(used_as_partner, partner)
+    }
+  }
+}
+
+print(combine_map)
+
+## 11. Build combined PSU IDs
+## For:
+## - small tract + partner => one combined PSU
+## - all others => PSU is the tract itself
+tract_pos <- tract_pos %>%
+  mutate(
+    PSU_ID = Tract,
+    combine_status = "single"
+  )
+
+if (nrow(combine_map) > 0) {
+  for (k in 1:nrow(combine_map)) {
+    a <- combine_map$tract_small[k]
+    b <- combine_map$tract_partner[k]
+    new_id <- paste0(a, "_", b)
+
+    tract_pos$PSU_ID[tract_pos$Tract %in% c(a, b)] <- new_id
+    tract_pos$combine_status[tract_pos$Tract == a] <- "small_combined"
+    tract_pos$combine_status[tract_pos$Tract == b] <- "partner_combined"
+  }
+}
+
+## 12. Aggregate to combined PSU frame
+## After combining, MOS and counts are sums across linked tracts
+psu_frame <- tract_pos %>%
+  group_by(PSU_ID) %>%
+  summarise(
+    component_tracts = paste(sort(Tract), collapse = ","),
+    NAME = paste(NAME, collapse = " | "),
+    n_tracts = n(),
+    TotHH = sum(TotHH, na.rm = TRUE),
+    TotPerson = sum(TotPerson, na.rm = TRUE),
+    TotAdult18plus = sum(TotAdult18plus, na.rm = TRUE),
+    n_BG = sum(n_BG, na.rm = TRUE),
+    Q1_18_34 = sum(Q1_18_34, na.rm = TRUE),
+    Q2_35_49 = sum(Q2_35_49, na.rm = TRUE),
+    Q3_50_64 = sum(Q3_50_64, na.rm = TRUE),
+    Q4_65plus = sum(Q4_65plus, na.rm = TRUE),
+    Si = sum(Si, na.rm = TRUE),
+    min_tract = min(Tract),
+    .groups = "drop"
+  ) %>%
+  arrange(min_tract)
+
+## 13. Recalculate first-stage constants on combined PSU frame
+## This is the frame that will actually be sampled
+S_total <- sum(psu_frame$Si, na.rm = TRUE)
+qbarbar <- S_total / (m_psu * nbar)
+interval <- S_total / m_psu
+
+psu_frame <- psu_frame %>%
+  mutate(
+    pi1 = m_psu * Si / S_total,
+    w1_base = 1 / pi1,
+    fail_qi_after = qbarbar > TotAdult18plus,
+    fail_pi_after = pi1 > 1
+  )
+
+cat("Total combined PSUs in frame =", nrow(psu_frame), "\n")
+cat("Total composite MOS S =", S_total, "\n")
+cat("Expected workload per SSU qbarbar =", qbarbar, "\n")
+cat("Systematic PPS interval =", interval, "\n")
+
+## 14. QC after combining
+## These are the checks that should be reported
+qc_combined_fail_qi <- psu_frame %>%
+  filter(fail_qi_after) %>%
+  select(PSU_ID, component_tracts, TotAdult18plus, Si, pi1)
+
+qc_combined_fail_pi <- psu_frame %>%
+  filter(fail_pi_after) %>%
+  select(PSU_ID, component_tracts, TotAdult18plus, Si, pi1)
+
+qc_combined_small_weights <- psu_frame %>%
+  arrange(desc(w1_base)) %>%
+  select(PSU_ID, component_tracts, TotAdult18plus, n_BG, Si, pi1, w1_base)
+
+combine_summary <- tract_pos %>%
+  count(combine_status)
+
+print(combine_summary)
+print(qc_combined_fail_qi)
+print(qc_combined_fail_pi)
+print(head(qc_combined_small_weights, 15))
+
+## 15. Systematic PPS selection on COMBINED PSU FRAME
+## Sort by tract GEOID proxy = min tract in combined PSU
+set.seed(-77)
+
+s_psu <- UPsystematic(psu_frame$pi1)
+
+psu_frame <- psu_frame %>%
+  mutate(
+    sample_psu = as.integer(s_psu)
+  )
+
+psu_sample <- psu_frame %>%
+  filter(sample_psu == 1) %>%
+  mutate(
+    PSU_weight = 1 / pi1
+  )
+
+cat("Number of sampled PSUs =", nrow(psu_sample), "\n")
+
+```
+
+
+```{r}
+# Frame file required by project
+frame_out <- psu_frame %>%
+  select(
+    PSU_ID, component_tracts, n_tracts, NAME,
+    TotHH, TotPerson, TotAdult18plus, n_BG,
+    Q1_18_34, Q2_35_49, Q3_50_64, Q4_65plus,
+    Si, pi1, w1_base
+  )
+
+# Sample file required by project
+sample_out <- psu_sample %>%
+  select(
+    PSU_ID, component_tracts, n_tracts, NAME,
+    TotHH, TotPerson, TotAdult18plus, n_BG,
+    Q1_18_34, Q2_35_49, Q3_50_64, Q4_65plus,
+    Si, pi1, PSU_weight
+  )
+
+# Documentation of links used for tract-level combining
+combine_out <- combine_map
+
+write.csv(frame_out, "FRAME1_first_stage_combined.csv", row.names = FALSE)
+write.csv(sample_out, "SAMPLE_first_stage_PSU_combined.csv", row.names = FALSE)
+write.csv(combine_out, "TRACT_COMBINING_MAP.csv", row.names = FALSE)
+
+# QC outputs
+write.csv(tract_zero_mos, "QC_zero_MOS_tracts_excluded.csv", row.names = FALSE)
+write.csv(combine_candidates, "QC_initial_small_tract_candidates.csv", row.names = FALSE)
+write.csv(qc_combined_fail_qi, "QC_after_combining_fail_qi.csv", row.names = FALSE)
+write.csv(qc_combined_fail_pi, "QC_after_combining_fail_pi.csv", row.names = FALSE)
+write.csv(qc_combined_small_weights, "QC_after_combining_weights.csv", row.names = FALSE)
+
+## ---------------------------
+## Summary output
+## ---------------------------
+summary_out <- data.frame(
+  total_tracts_raw = nrow(tract_raw),
+  unique_tracts = nrow(tract),
+  zero_MOS_tracts_excluded = nrow(tract_zero_mos),
+  positive_MOS_tracts = nrow(tract_pos),
+  initial_small_tract_candidates = nrow(combine_candidates),
+  number_of_combined_pairs = nrow(combine_map),
+  final_combined_PSUs_in_frame = nrow(psu_frame),
+  sampled_PSUs = nrow(psu_sample),
+  S_total = S_total,
+  qbarbar = qbarbar,
+  interval = interval,
+  min_pi1 = min(psu_frame$pi1),
+  max_pi1 = max(psu_frame$pi1)
+)
+
+print(summary_out)
+write.csv(summary_out, "SUMMARY_first_stage_combined.csv", row.names = FALSE)
+```
+
+```{r}
+# Second-stage SSU sampling for Detroit project
+# APPEND after the first-stage code
+# Do NOT reset set.seed(-77)
+
+## 16. Prepare BG frame
+bg <- bg_raw %>%
+  distinct(BlockGroup, .keep_all = TRUE) %>%
+  mutate(
+    BlockGroup = as.character(BlockGroup),
+    Tract = substr(BlockGroup, 1, 11)
+  ) %>%
+  mutate(
+    Q1_18_34 =
+      Male18to19Yrs + Male20Yrs + Male21Yrs + Male22to24Yrs +
+      Male25to29Yrs + Male30to34Yrs +
+      Female18to19Yrs + Female20Yrs + Female21Yrs + Female22to24Yrs +
+      Female25to29Yrs + Female30to34Yrs,
+
+    Q2_35_49 =
+      Male35to39Yrs + Male40to44Yrs + Male45to49Yrs +
+      Female35to39Yrs + Female40to44Yrs + Female45to49Yrs,
+
+    Q3_50_64 =
+      Male50to54Yrs + Male55to59Yrs + Male60to61Yrs + Male62to64Yrs +
+      Female50to54Yrs + Female55to59Yrs + Female60to61Yrs + Female62to64Yrs,
+
+    Q4_65plus =
+      Male65to66Yrs + Male67to69Yrs + Male70to74Yrs + Male75to79Yrs +
+      Male80to84Yrs + MaleGE85Yrs +
+      Female65to66Yrs + Female67to69Yrs + Female70to74Yrs + Female75to79Yrs +
+      Female80to84Yrs + FemaleGE85Yrs,
+
+    TotAdult18plus = Q1_18_34 + Q2_35_49 + Q3_50_64 + Q4_65plus,
+
+    Sij = f1 * Q1_18_34 +
+          f2 * Q2_35_49 +
+          f3 * Q3_50_64 +
+          f4 * Q4_65plus
+  )
+
+split_component_tracts <- function(x) {
+  trimws(unlist(strsplit(x, ",")))
+}
+
+find_bg_partner <- function(target_bg, all_bgs, flagged_bgs, already_used) {
+  idx <- match(target_bg, all_bgs)
+
+  offsets <- c(rbind(seq(1, length(all_bgs)), -seq(1, length(all_bgs))))
+  offsets <- offsets[!is.na(offsets)]
+
+  for (off in offsets) {
+    j <- idx + off
+    if (j >= 1 && j <= length(all_bgs)) {
+      cand <- all_bgs[j]
+      if (cand != target_bg &&
+          !(cand %in% already_used) &&
+          !(cand %in% flagged_bgs)) {
+        return(cand)
+      }
+    }
+  }
+  return(NA_character_)
+}
+
+process_one_psu_stage2 <- function(psu_row, bg_data, qbarbar, f1, f2, f3, f4,
+                                   mos_tol = 1e-8) {
+
+  psu_id <- psu_row$PSU_ID
+  component_tracts <- split_component_tracts(psu_row$component_tracts)
+
+  ## BG frame within sampled PSU
+  bg_i <- bg_data %>%
+    filter(Tract %in% component_tracts) %>%
+    arrange(BlockGroup) %>%
+    mutate(
+      PSU_ID = psu_id,
+      pi1 = psu_row$pi1,
+      PSU_Si = psu_row$Si,
+      must_combine = (Sij <= 0) | (TotAdult18plus < qbarbar),
+      SSU_ID = BlockGroup,
+      combine_status = "single"
+    )
+
+  if (nrow(bg_i) == 0) {
+    stop(paste("No BGs found in sampled PSU", psu_id))
+  }
+
+  ## map of BG combinations
+  combine_map_i <- data.frame(
+    PSU_ID = character(0),
+    bg_small = character(0),
+    bg_partner = character(0),
+    stringsAsFactors = FALSE
+  )
+
+  flagged_bgs <- bg_i %>%
+    filter(must_combine) %>%
+    pull(BlockGroup)
+
+  ## special case:
+  ## if all BGs in this PSU are flagged, combine them all into one SSU
+  if (length(flagged_bgs) == nrow(bg_i) && nrow(bg_i) > 0) {
+
+    all_bg_id <- paste(sort(bg_i$BlockGroup), collapse = "_")
+    bg_i <- bg_i %>%
+      mutate(
+        SSU_ID = all_bg_id,
+        combine_status = "all_combined"
+      )
+
+    if (nrow(bg_i) >= 2) {
+      combine_map_i <- data.frame(
+        PSU_ID = rep(psu_id, nrow(bg_i) - 1),
+        bg_small = bg_i$BlockGroup[1:(nrow(bg_i) - 1)],
+        bg_partner = bg_i$BlockGroup[2:nrow(bg_i)],
+        stringsAsFactors = FALSE
+      )
+    }
+
+  } else {
+
+    used_as_partner <- character(0)
+    all_bgs_in_order <- bg_i$BlockGroup
+
+    if (length(flagged_bgs) > 0) {
+      for (bgid in flagged_bgs) {
+        if (!(bgid %in% combine_map_i$bg_small) &&
+            !(bgid %in% used_as_partner)) {
+
+          partner <- find_bg_partner(
+            target_bg = bgid,
+            all_bgs = all_bgs_in_order,
+            flagged_bgs = flagged_bgs,
+            already_used = used_as_partner
+          )
+
+          if (!is.na(partner)) {
+            combine_map_i <- bind_rows(
+              combine_map_i,
+              data.frame(
+                PSU_ID = psu_id,
+                bg_small = bgid,
+                bg_partner = partner,
+                stringsAsFactors = FALSE
+              )
+            )
+            used_as_partner <- c(used_as_partner, partner)
+          }
+        }
+      }
+    }
+
+    ## assign combined SSU IDs
+    if (nrow(combine_map_i) > 0) {
+      for (k in 1:nrow(combine_map_i)) {
+        a <- combine_map_i$bg_small[k]
+        b <- combine_map_i$bg_partner[k]
+        new_id <- paste0(a, "_", b)
+
+        bg_i$SSU_ID[bg_i$BlockGroup %in% c(a, b)] <- new_id
+        bg_i$combine_status[bg_i$BlockGroup == a] <- "small_combined"
+        bg_i$combine_status[bg_i$BlockGroup == b] <- "partner_combined"
+      }
+    }
+  }
+
+  ## combined stage-2 frame within PSU
+  frame2_i <- bg_i %>%
+    group_by(PSU_ID, SSU_ID) %>%
+    summarise(
+      component_bgs = paste(sort(BlockGroup), collapse = ","),
+      component_tracts = paste(sort(unique(Tract)), collapse = ","),
+      n_bgs_combined = n(),
+      NAME = paste(NAME, collapse = " | "),
+      TotHH = sum(TotHH, na.rm = TRUE),
+      TotPerson = sum(TotPerson, na.rm = TRUE),
+      TotAdult18plus = sum(TotAdult18plus, na.rm = TRUE),
+      Q1_18_34 = sum(Q1_18_34, na.rm = TRUE),
+      Q2_35_49 = sum(Q2_35_49, na.rm = TRUE),
+      Q3_50_64 = sum(Q3_50_64, na.rm = TRUE),
+      Q4_65plus = sum(Q4_65plus, na.rm = TRUE),
+      Sij = sum(Sij, na.rm = TRUE),
+      pi1 = first(pi1),
+      PSU_Si = first(PSU_Si),
+      min_bg = min(BlockGroup),
+      .groups = "drop"
+    ) %>%
+    arrange(min_bg)
+
+  ## check BG-based MOS against first-stage PSU MOS
+  Si_check <- sum(frame2_i$Sij, na.rm = TRUE)
+  mos_diff <- abs(Si_check - frame2_i$PSU_Si[1])
+
+  if (mos_diff > mos_tol) {
+    stop(paste("MOS inconsistency in PSU", psu_id,
+               ": sum(Sij) =", round(Si_check, 8),
+               "but PSU_Si =", round(frame2_i$PSU_Si[1], 8)))
+  }
+
+  frame2_i <- frame2_i %>%
+    mutate(
+      Si_check = Si_check,
+      mos_diff = mos_diff,
+      pi2_cond = Sij / PSU_Si,
+      pi_joint = pi1 * pi2_cond,
+      base_weight = 1 / pi_joint,
+      rate_d1 = qbarbar * f1 / Sij,
+      rate_d2 = qbarbar * f2 / Sij,
+      rate_d3 = qbarbar * f3 / Sij,
+      rate_d4 = qbarbar * f4 / Sij,
+      fail_after = (Sij <= 0) | (TotAdult18plus < qbarbar) | (pi2_cond > 1)
+    )
+
+  ## if any SSU still fails after combining, stop
+  if (any(frame2_i$fail_after)) {
+    stop(paste("Second-stage QC failed in PSU", psu_id,
+               ": some SSUs remain infeasible after combining"))
+  }
+
+  ## systematic PPS: select 1 BG/SSU
+  s_ssu <- UPsystematic(frame2_i$pi2_cond)
+
+  sample2_i <- frame2_i %>%
+    mutate(sample_ssu = as.integer(s_ssu)) %>%
+    filter(sample_ssu == 1)
+
+  ## QC note: if only one final SSU remains, stage 2 is deterministic in this PSU
+  deterministic_i <- data.frame(
+    PSU_ID = psu_id,
+    n_final_ssu = nrow(frame2_i),
+    deterministic_stage2 = (nrow(frame2_i) == 1),
+    stringsAsFactors = FALSE
+  )
+
+  list(
+    frame2 = frame2_i,
+    sample2 = sample2_i,
+    combine_map = combine_map_i,
+    deterministic = deterministic_i
+  )
+}
+
+
+## 17. Run second-stage selection over sampled PSUs
+stage2_results <- vector("list", nrow(psu_sample))
+
+for (ii in seq_len(nrow(psu_sample))) {
+  stage2_results[[ii]] <- process_one_psu_stage2(
+    psu_row = psu_sample[ii, ],
+    bg_data = bg,
+    qbarbar = qbarbar,
+    f1 = f1, f2 = f2, f3 = f3, f4 = f4
+  )
+}
+
+frame2_out <- bind_rows(lapply(stage2_results, `[[`, "frame2"))
+sample2_out <- bind_rows(lapply(stage2_results, `[[`, "sample2"))
+bg_combine_out <- bind_rows(lapply(stage2_results, `[[`, "combine_map"))
+qc2_deterministic <- bind_rows(lapply(stage2_results, `[[`, "deterministic"))
+
+
+## 18. Required QC summary
+qc2_required <- frame2_out %>%
+  filter(fail_after) %>%
+  select(
+    PSU_ID, SSU_ID, component_bgs, component_tracts,
+    TotAdult18plus, Sij, pi2_cond, fail_after
+  )
+
+qc2_deterministic_only <- qc2_deterministic %>%
+  filter(deterministic_stage2)
+
+summary_second_stage <- data.frame(
+  sampled_PSUs_from_stage1 = nrow(psu_sample),
+  final_SSUs_in_FRAME2 = nrow(frame2_out),
+  sampled_SSUs = nrow(sample2_out),
+  number_of_BG_combine_pairs = nrow(bg_combine_out),
+  flagged_SSUs_after_combining = nrow(qc2_required),
+  deterministic_PSUs_at_stage2 = nrow(qc2_deterministic_only),
+  min_pi2 = min(frame2_out$pi2_cond, na.rm = TRUE),
+  max_pi2 = max(frame2_out$pi2_cond, na.rm = TRUE),
+  min_pij = min(frame2_out$pi_joint, na.rm = TRUE),
+  max_pij = max(frame2_out$pi_joint, na.rm = TRUE),
+  max_mos_diff = max(frame2_out$mos_diff, na.rm = TRUE)
+)
+
+print(summary_second_stage)
+print(qc2_required)
+print(qc2_deterministic_only)
+
+## 19. Final files
+FRAME2_second_stage <- frame2_out %>%
+  select(
+    PSU_ID, component_tracts,
+    SSU_ID, component_bgs, n_bgs_combined,
+    NAME,
+    TotHH, TotPerson, TotAdult18plus,
+    Q1_18_34, Q2_35_49, Q3_50_64, Q4_65plus,
+    Sij, PSU_Si, Si_check, mos_diff, pi2_cond
+  ) %>%
+  arrange(PSU_ID, SSU_ID)
+
+SAMPLE2_second_stage <- sample2_out %>%
+  select(
+    PSU_ID, component_tracts,
+    SSU_ID, component_bgs, n_bgs_combined,
+    NAME,
+    TotHH, TotPerson, TotAdult18plus,
+    Q1_18_34, Q2_35_49, Q3_50_64, Q4_65plus,
+    PSU_Si, Sij,
+    pi1, pi2_cond, pi_joint, base_weight,
+    rate_d1, rate_d2, rate_d3, rate_d4
+  ) %>%
+  arrange(PSU_ID, SSU_ID)
+
+write.csv(FRAME2_second_stage,
+          "FRAME2_second_stage_BG.csv",
+          row.names = FALSE)
+
+write.csv(SAMPLE2_second_stage,
+          "SAMPLE2_second_stage_selected_BG.csv",
+          row.names = FALSE)
+
+write.csv(bg_combine_out,
+          "BG_COMBINING_MAP_second_stage.csv",
+          row.names = FALSE)
+
+write.csv(qc2_required,
+          "QC_second_stage_required.csv",
+          row.names = FALSE)
+
+write.csv(qc2_deterministic_only,
+          "QC_second_stage_deterministic_PSUs.csv",
+          row.names = FALSE)
+
+write.csv(summary_second_stage,
+          "SUMMARY_second_stage.csv",
+          row.names = FALSE)
+```
+
+
